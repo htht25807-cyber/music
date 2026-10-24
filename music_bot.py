@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import shutil
 from collections import defaultdict
 
 import discord
@@ -39,6 +40,21 @@ FFMPEG_OPTS = {
     ),
     "options": "-vn",
 }
+
+# Cookies YouTube (không bắt buộc): trên Render thêm Secret File tên cookies.txt
+COOKIES_SRC = os.environ.get("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
+COOKIE_OPTS = {}
+if os.path.exists(COOKIES_SRC):
+    try:
+        # Chép sang /tmp vì yt-dlp cần ghi lại cookies, còn /etc/secrets chỉ đọc được
+        shutil.copyfile(COOKIES_SRC, "/tmp/yt_cookies.txt")
+        COOKIE_OPTS = {"cookiefile": "/tmp/yt_cookies.txt"}
+        print("Đã nạp cookies YouTube.")
+    except Exception as exc:
+        print("Không nạp được cookies YouTube:", exc)
+else:
+    print("Chưa có cookies YouTube (YouTube có thể chặn IP của server).")
+YDL_OPTS.update(COOKIE_OPTS)
 
 # Bài tự động phát tiếp sẽ bỏ qua video dài hơn mức này (livestream, mix hàng giờ...)
 AUTO_MAX_SECONDS = 20 * 60
@@ -152,6 +168,7 @@ def find_related(video_id, title, played: set):
         "no_warnings": True,
         "extract_flat": "in_playlist",
         "playlistend": 25,
+        **COOKIE_OPTS,
     }
     sources = []
     if video_id:
@@ -351,10 +368,15 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
             recent_ids[gid].append(auto_id)  # Không chọn lại bài lỗi này
             if retries < 2:
                 return await play_next(guild, channel, retries + 1)
-        try:
-            await channel.send(
-                f"❌ Không phát được `{query[:80]}`: {str(exc)[:150]}"
+        print(f"Lỗi lấy bài {query[:80]!r}: {exc}")
+        reason = str(exc)
+        if "Sign in to confirm" in reason or "cookies" in reason.lower():
+            reason = (
+                "YouTube đang chặn IP của server và đòi đăng nhập. "
+                "Cần thêm cookies cho bot (Secret File cookies.txt trên Render)."
             )
+        try:
+            await channel.send(f"❌ Không phát được `{query[:80]}`: {reason[:200]}")
         except Exception:
             pass
         if auto_id:
@@ -415,6 +437,20 @@ class MusicBot(discord.Client):
 
 
 bot = MusicBot()
+
+
+@bot.tree.error
+async def on_app_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
+    """Lệnh nào bị lỗi cũng trả lời người dùng và ghi vào log."""
+    print(f"Lỗi lệnh /{inter.command.name if inter.command else '?'}: {error!r}")
+    msg = "❌ Có lỗi khi chạy lệnh này, hãy thử lại."
+    try:
+        if inter.response.is_done():
+            await inter.followup.send(msg, ephemeral=True)
+        else:
+            await inter.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 
 # ==================== /PLAY ====================
@@ -828,6 +864,8 @@ async def musiclist(inter: discord.Interaction):
 async def stop(inter: discord.Interaction):
     gid = inter.guild_id
     queues[gid].clear()
+    # Trả lời ngay: ngắt kênh thoại có thể lâu hơn 3 giây, Discord sẽ báo "không phản hồi"
+    await inter.response.send_message("⏹️ Đang dừng nhạc và thoát kênh thoại...")
     stopping.add(gid)  # Chặn play_next tự phát bài mới trong lúc đang dừng
     vc = inter.guild.voice_client
 
@@ -842,15 +880,12 @@ async def stop(inter: discord.Interaction):
     current_song.pop(gid, None)
     now_data.pop(gid, None)
     await clear_menu(gid)
-    await inter.response.send_message(
-        "⏹️ Đã dừng nhạc, xóa hàng đợi và thoát kênh thoại."
-    )
 
 # ==================== /SEARCH ====================
 
 def search_youtube(query: str, limit: int = 10) -> list[dict]:
     """Tìm trên YouTube, chỉ lấy thông tin cơ bản (nhanh, không tải gì)."""
-    opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": True, **COOKIE_OPTS}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
 
@@ -974,7 +1009,8 @@ async def search(inter: discord.Interaction, query: str):
 async def start_web_server():
     """Web server nhỏ để Render nhận diện service và để UptimeRobot ping."""
     async def health(request):
-        return web.Response(text="Music bot is running")
+        status = "online" if bot.is_ready() else "connecting"
+        return web.Response(text=f"Music bot is running (discord: {status})")
 
     app = web.Application()
     app.router.add_get("/", health)
@@ -990,8 +1026,25 @@ async def main():
         raise ValueError("Không tìm thấy biến môi trường DISCORD_TOKEN trên Render.")
 
     await start_web_server()
-    async with bot:
-        await bot.start(TOKEN)
+
+    delay = 60
+    while True:
+        try:
+            await bot.login(TOKEN)
+            break
+        except discord.LoginFailure:
+            raise  # Token sai thì thử lại cũng vô ích
+        except discord.HTTPException as exc:
+            if exc.status != 429:
+                raise
+            print(f"Discord đang chặn IP của server (429). Thử lại sau {delay} giây...")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 900)
+
+    try:
+        await bot.connect(reconnect=True)
+    finally:
+        await bot.close()
 
 
 if __name__ == "__main__":
