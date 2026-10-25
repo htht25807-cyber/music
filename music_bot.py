@@ -61,6 +61,10 @@ YDL_OPTS.update(COOKIE_OPTS)
 # Bài tự động phát tiếp sẽ bỏ qua video dài hơn mức này (livestream, mix hàng giờ...)
 AUTO_MAX_SECONDS = 20 * 60
 
+# Tăng tốc chuyển bài: chuẩn bị sẵn thông tin bài kế tiếp khi bài hiện tại đang phát.
+RESOLVED_CACHE_TTL_SECONDS = 45 * 60  # URL stream có hạn sử dụng, không giữ cache quá lâu
+RESOLVED_CACHE_MAX_ITEMS = 250
+
 # Tự xóa tin nhắn của bot đã cũ trong kênh được dùng lệnh (mặc định 30 phút).
 BOT_MESSAGE_TTL_SECONDS = 30 * 60
 MESSAGE_CLEANUP_INTERVAL_SECONDS = 5 * 60
@@ -85,6 +89,13 @@ titles = {}                                  # query/link -> tên bài (để hi
 stopping = set()                             # Server đang chạy /stop (chặn tự phát bài mới)
 auto_paused = set()                          # Server đang tạm dừng vì kênh thoại trống (tự tiếp tục khi có người về)
 waiting_for_listener = set()                 # Hết bài lúc kênh trống: chờ có người vào lại mới phát tiếp
+
+# State phục vụ chuẩn bị sẵn bài tiếp theo
+planned_list_next = {}                         # Bài danh sách nhạc đã chọn trước để phát nhanh
+resolved_cache = {}                            # query -> (thời điểm cache, thông tin stream)
+resolution_tasks = {}                          # query -> tác vụ phân giải stream đang chạy
+related_cache = {}                             # (guild_id, seed_key) -> bài gợi ý đã chuẩn bị
+related_tasks = {}                             # (guild_id, seed_key) -> tác vụ chuẩn bị bài gợi ý
 
 # Dữ liệu riêng cho từng người dùng
 favorites = defaultdict(list)                # user_id -> [{"title": ..., "url": ...}]
@@ -213,6 +224,157 @@ def find_related(video_id, title, played: set):
             return {"id": vid, "url": f"https://www.youtube.com/watch?v={vid}"}
 
     return None
+
+
+# ==================== PRELOAD BÀI KẾ TIẾP ====================
+
+def get_cached_resolution(query: str):
+    item = resolved_cache.get(query)
+    if not item:
+        return None
+    cached_at, data = item
+    if time.monotonic() - cached_at > RESOLVED_CACHE_TTL_SECONDS:
+        resolved_cache.pop(query, None)
+        return None
+    return data
+
+
+async def resolve_and_cache(query: str) -> dict:
+    """Phân giải URL stream trong thread nền, lưu để lần phát kế tiếp khỏi chờ."""
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, extract, query)
+    resolved_cache[query] = (time.monotonic(), data)
+
+    # Giới hạn RAM; xóa cache cũ nhất trước.
+    while len(resolved_cache) > RESOLVED_CACHE_MAX_ITEMS:
+        oldest = min(resolved_cache, key=lambda key: resolved_cache[key][0])
+        resolved_cache.pop(oldest, None)
+    return data
+
+
+def schedule_resolution(query: str):
+    """Bắt đầu phân giải bài ở nền; không chặn luồng phát bài hiện tại."""
+    if not query or get_cached_resolution(query) is not None:
+        return None
+
+    existing = resolution_tasks.get(query)
+    if existing is not None and not existing.done():
+        return existing
+
+    task = asyncio.create_task(resolve_and_cache(query))
+    resolution_tasks[query] = task
+
+    def finished(done_task):
+        if resolution_tasks.get(query) is done_task:
+            resolution_tasks.pop(query, None)
+        if done_task.cancelled():
+            return
+        try:
+            error = done_task.exception()
+        except Exception:
+            error = None
+        if error:
+            print(f"Chuẩn bị trước bài thất bại ({query[:70]}): {error}")
+
+    task.add_done_callback(finished)
+    return task
+
+
+async def get_resolution(query: str) -> dict:
+    """Lấy dữ liệu đã cache hoặc chờ tác vụ chuẩn bị đang chạy."""
+    cached = get_cached_resolution(query)
+    if cached is not None:
+        return cached
+    task = schedule_resolution(query)
+    if task is None:
+        cached = get_cached_resolution(query)
+        if cached is not None:
+            return cached
+        task = resolution_tasks.get(query)
+    if task is None:
+        task = schedule_resolution(query)
+    return await task
+
+
+def pick_music_list_song(gid: int):
+    choices = list(music_lists[gid])
+    if not choices:
+        return None
+    previous = current_song.get(gid)
+    if len(choices) > 1 and previous in choices:
+        choices.remove(previous)
+    return random.choice(choices) if choices else None
+
+
+async def prefetch_related_worker(gid: int, seed: dict, seed_key: str):
+    """Tìm và phân giải sẵn bài gợi ý trong lúc bài hiện tại vẫn đang phát."""
+    loop = asyncio.get_running_loop()
+    found = await loop.run_in_executor(
+        None, find_related,
+        seed.get("yt_id"), seed.get("title"), set(recent_ids[gid]),
+    )
+    if not found:
+        return
+    data = await get_resolution(found["url"])
+    related_cache[(gid, seed_key)] = {
+        "cached_at": time.monotonic(),
+        "url": found["url"],
+        "id": found["id"],
+        "data": data,
+    }
+
+
+def schedule_related_prefetch(gid: int, seed: dict):
+    if not seed or not autoplay[gid]:
+        return
+    seed_key = str(seed.get("yt_id") or seed.get("page") or seed.get("title") or "")
+    if not seed_key:
+        return
+    cache_key = (gid, seed_key)
+    cached = related_cache.get(cache_key)
+    if cached and time.monotonic() - cached["cached_at"] <= RESOLVED_CACHE_TTL_SECONDS:
+        return
+    task = related_tasks.get(cache_key)
+    if task is not None and not task.done():
+        return
+
+    task = asyncio.create_task(prefetch_related_worker(gid, dict(seed), seed_key))
+    related_tasks[cache_key] = task
+
+    def finished(done_task):
+        if related_tasks.get(cache_key) is done_task:
+            related_tasks.pop(cache_key, None)
+        if done_task.cancelled():
+            return
+        try:
+            error = done_task.exception()
+        except Exception:
+            error = None
+        if error:
+            print(f"Chuẩn bị bài tự động tiếp theo thất bại ở server {gid}: {error}")
+
+    task.add_done_callback(finished)
+
+
+def prefetch_next_track(gid: int, current_data: dict | None = None):
+    """Ưu tiên chuẩn bị đúng bài kế tiếp: hàng đợi -> danh sách -> bài gợi ý."""
+    if queues[gid]:
+        # Chỉ chuẩn bị đầu hàng đợi, tránh tốn tài nguyên phân giải cả danh sách.
+        schedule_resolution(queues[gid][0])
+        return
+
+    if autoplay[gid] and music_lists[gid]:
+        planned = planned_list_next.get(gid)
+        if planned not in music_lists[gid]:
+            planned = pick_music_list_song(gid)
+            if planned is not None:
+                planned_list_next[gid] = planned
+        if planned:
+            schedule_resolution(planned)
+        return
+
+    if autoplay[gid] and current_data:
+        schedule_related_prefetch(gid, current_data)
 
 
 # ==================== NOW PLAYING MENU ====================
@@ -458,7 +620,8 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
     if channel is None:
         return
 
-    await clear_menu(gid)
+    # Xóa menu cũ song song với quá trình tìm/phát bài mới để giảm độ trễ chuyển bài.
+    asyncio.create_task(clear_menu(gid))
 
     # Kênh thoại đang trống: không phát cho không ai nghe, chờ có người vào lại
     if listener_count(vc.channel) == 0:
@@ -469,34 +632,54 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
     q = queues[gid]
     auto_id = None  # id video nếu bài này do bot tự chọn
 
+    preloaded_data = None
     if q:
         query = q.pop(0)
+        # Tải thông tin bài sau trong lúc đang phân giải bài chuẩn bị phát.
+        if q:
+            schedule_resolution(q[0])
     elif autoplay[gid] and music_lists[gid]:
-        choices = list(music_lists[gid])
-        previous = current_song.get(gid)
-
-        # Tránh phát trùng bài hiện tại nếu danh sách có nhiều lựa chọn
-        if len(choices) > 1 and previous in choices:
-            choices.remove(previous)
-
-        query = random.choice(choices)
-    elif autoplay[gid]:
-        # Hết hàng đợi và không có danh sách nhạc: tự mở bài liên quan như YouTube
-        seed = now_data.get(gid) or {}
-        loop = asyncio.get_running_loop()
-        found = await loop.run_in_executor(
-            None, find_related,
-            seed.get("yt_id"), seed.get("title"), set(recent_ids[gid]),
-        )
-        if not found:
+        query = planned_list_next.pop(gid, None)
+        if query not in music_lists[gid]:
+            query = None
+        if query is None:
+            query = pick_music_list_song(gid)
+        if query is None:
             return
-        query, auto_id = found["url"], found["id"]
+    elif autoplay[gid]:
+        # Nếu đã chuẩn bị sẵn bài gợi ý thì dùng ngay, không tìm lại sau khi bài kết thúc.
+        seed = now_data.get(gid) or {}
+        seed_key = str(seed.get("yt_id") or seed.get("page") or seed.get("title") or "")
+        cache_key = (gid, seed_key)
+        related = related_cache.get(cache_key)
+        if related and time.monotonic() - related["cached_at"] <= RESOLVED_CACHE_TTL_SECONDS:
+            related_cache.pop(cache_key, None)
+            query, auto_id, preloaded_data = related["url"], related["id"], related["data"]
+        else:
+            # Nếu tìm bài gợi ý vẫn đang chạy, chờ nó thay vì chạy truy vấn trùng lần nữa.
+            pending = related_tasks.get(cache_key)
+            if pending is not None and not pending.done():
+                try:
+                    await pending
+                except Exception:
+                    pass
+                related = related_cache.get(cache_key)
+                if related and time.monotonic() - related["cached_at"] <= RESOLVED_CACHE_TTL_SECONDS:
+                    related_cache.pop(cache_key, None)
+                    query, auto_id, preloaded_data = related["url"], related["id"], related["data"]
+            if preloaded_data is None:
+                found = await asyncio.get_running_loop().run_in_executor(
+                    None, find_related,
+                    seed.get("yt_id"), seed.get("title"), set(recent_ids[gid]),
+                )
+                if not found:
+                    return
+                query, auto_id = found["url"], found["id"]
     else:
         return
 
-    loop = asyncio.get_running_loop()
     try:
-        data = await loop.run_in_executor(None, extract, query)
+        data = preloaded_data if preloaded_data is not None else await get_resolution(query)
     except Exception as exc:
         if auto_id:
             recent_ids[gid].append(auto_id)  # Không chọn lại bài lỗi này
@@ -546,6 +729,8 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
         vc.play(source, after=make_after_callback(guild, channel, gid))
         play_positions[gid] = 0.0
         play_started_at[gid] = time.monotonic()
+        # Chuẩn bị bài kế tiếp ngay khi bài hiện tại bắt đầu, không đợi đến khi hết bài.
+        prefetch_next_track(gid, data)
     except Exception as exc:
         print("Không thể phát:", exc)
         return await play_next(guild, channel)
@@ -737,6 +922,8 @@ async def play(inter: discord.Interaction, query: str):
             return await inter.followup.send("❌ Không tìm thấy bài hát.")
 
         queues[inter.guild.id].extend(items)
+        if queues[inter.guild.id]:
+            schedule_resolution(queues[inter.guild.id][0])
         await inter.followup.send(
             f"➕ Đã thêm **{len(items)} bài** vào hàng đợi."
         )
@@ -796,6 +983,7 @@ async def do_return(inter: discord.Interaction):
 
     # Đưa bài trước lên đầu hàng đợi, giữ nguyên những bài chờ khác
     queues[gid].insert(0, previous)
+    schedule_resolution(previous)
     play_channels[gid] = inter.channel
 
     await inter.response.send_message(
@@ -935,6 +1123,7 @@ class SkipToView(discord.ui.View):
 
         selected = q[index]
         del q[:index]  # Đưa bài được chọn lên đầu, bỏ các bài đứng trước nó.
+        schedule_resolution(selected)
         play_channels[self.gid] = self.channel
         await inter.response.edit_message(
             content=f"⏭️ Đang chuyển đến **{queue_item_title(selected)[:180]}** (vị trí {index + 1}).",
@@ -1070,6 +1259,8 @@ class FavoritesView(discord.ui.View):
             vc = await connect_voice(inter)
             play_channels[gid] = inter.channel
             queues[gid].extend(f["url"] for f in favs)
+            if queues[gid]:
+                schedule_resolution(queues[gid][0])
             await inter.followup.send(
                 f"✅ Đã xếp **{len(favs)} bài** yêu thích vào hàng đợi.",
                 ephemeral=True,
@@ -1189,6 +1380,8 @@ class MusicListView(discord.ui.View):
 
             play_channels[gid] = inter.channel
             queues[gid].extend(songs)
+            if queues[gid]:
+                schedule_resolution(queues[gid][0])
             await inter.followup.send(
                 f"✅ Đã xếp **{len(songs)} bài** phát lần lượt.",
                 ephemeral=True,
@@ -1253,6 +1446,9 @@ async def stop(inter: discord.Interaction):
 
     current_song.pop(gid, None)
     now_data.pop(gid, None)
+    planned_list_next.pop(gid, None)
+    for cache_key in [key for key in related_cache if key[0] == gid]:
+        related_cache.pop(cache_key, None)
     play_positions.pop(gid, None)
     play_started_at.pop(gid, None)
     auto_paused.discard(gid)
@@ -1322,6 +1518,8 @@ class SearchSelect(discord.ui.Select):
             play_channels[gid] = inter.channel
             titles[chosen["url"]] = chosen["title"]
             queues[gid].append(chosen["url"])
+            if len(queues[gid]) == 1:
+                schedule_resolution(queues[gid][0])
             self.view.stop()
             await inter.edit_original_response(
                 content=f"✅ Đã chọn: **{chosen['title']}**", view=None
