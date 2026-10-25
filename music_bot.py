@@ -30,7 +30,7 @@ except Exception:
     sp = None
 
 YDL_OPTS = {
-    "format": "bestaudio[acodec=opus]/bestaudio/best",  # Ưu tiên opus (Discord dùng opus)
+    "format": "bestaudio[acodec=opus]/bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
@@ -38,7 +38,15 @@ YDL_OPTS = {
     "retries": 2,
     "cachedir": "/tmp/yt-dlp-cache",
     "check_formats": False,
-    "extractor_args": {"youtube": {"skip": ["dash", "hls", "translated_subs"]}},
+
+    "extractor_args": {
+        "youtube": {
+            "skip": ["dash", "hls", "translated_subs"]
+        },
+        "youtubetab": {
+            "skip": ["authcheck"]
+        }
+    },
 }
 
 FFMPEG_OPTS = {
@@ -52,7 +60,6 @@ FFMPEG_OPTS = {
     ),
     "options": "-vn",
 }
-
 # Cookies YouTube (không bắt buộc): trên Render thêm Secret File tên cookies.txt
 COOKIES_SRC = os.environ.get("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
 COOKIE_OPTS = {}
@@ -230,84 +237,137 @@ def spotify_to_queries(link: str) -> list[str]:
 # ==================== AUTO NEXT (BÀI GỢI Ý) ====================
 
 def find_related(video_id, title, played: set):
-    """Tìm bài gợi ý giống YouTube autoplay.
-
-    Ưu tiên YouTube Mix của bài vừa phát; nếu không có thì tìm theo tên bài.
-    Bỏ qua bài đã phát (played) và video quá dài (livestream, mix hàng giờ).
     """
+    Tìm bài hát liên quan bằng YouTube Search, không dùng YouTube Mix.
+    Bỏ qua bài đã phát, bài hiện tại và video quá dài.
+    """
+    if not title or not title.strip():
+        return None
+
     opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
-        "playlistend": 25,
+        "playlistend": 10,
         "socket_timeout": 10,
         "retries": 2,
         "cachedir": "/tmp/yt-dlp-cache",
         **COOKIE_OPTS,
     }
-    sources = []
-    if video_id:
-        sources.append(
-            f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
-        )
-    if title:
-        sources.append(f"ytsearch10:{title}")
 
-    for index, src in enumerate(sources):
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(src, download=False)
-        except Exception as exc:
-            print("Không tìm được bài gợi ý:", exc)
+    # Chỉ tìm bằng tên bài hát, không truy cập playlist RD...
+    query = f"ytsearch10:{title.strip()}"
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+    except Exception as exc:
+        print("Không tìm được bài gợi ý:", exc)
+        return None
+
+    entries = [
+        entry
+        for entry in (info or {}).get("entries") or []
+        if entry
+    ]
+
+    # Không phát lại bài hiện tại hoặc những bài đã phát gần đây.
+    excluded_ids = set(played or set())
+
+    if video_id:
+        excluded_ids.add(video_id)
+
+    for entry in entries:
+        vid = entry.get("id")
+
+        if not vid or vid in excluded_ids:
             continue
 
-        entries = [e for e in (info or {}).get("entries") or [] if e]
-        # Kết quả tìm theo tên: bỏ kết quả đầu vì thường là chính bài vừa phát
-        if src.startswith("ytsearch"):
-            entries = entries[1:]
+        # Bỏ qua livestream và video đang phát trực tiếp.
+        if entry.get("is_live"):
+            continue
 
-        for entry in entries:
-            vid = entry.get("id")
-            if not vid or vid in played:
-                continue
-            duration = entry.get("duration")
-            if duration and duration > AUTO_MAX_SECONDS:
-                continue
-            return {"id": vid, "url": f"https://www.youtube.com/watch?v={vid}"}
+        if entry.get("live_status") in ("is_live", "is_upcoming"):
+            continue
+
+        # Bỏ qua video dài hơn giới hạn autoplay.
+        duration = entry.get("duration")
+
+        if duration is not None and duration > AUTO_MAX_SECONDS:
+            continue
+
+        return {
+            "id": vid,
+            "url": f"https://www.youtube.com/watch?v={vid}",
+        }
 
     return None
 
 
 def prefetch_related(gid: int):
-    """Tìm sẵn bài gợi ý ngay khi bài hiện tại phát (chỉ khi hàng đợi và danh sách nhạc trống)."""
+    """
+    Tìm trước bài liên quan trong lúc bài hiện tại đang phát.
+    Chỉ tìm khi hàng đợi và danh sách nhạc đều trống.
+    """
     if not autoplay[gid] or queues[gid] or music_lists[gid]:
         return
+
     data = now_data.get(gid) or {}
+    title = data.get("title")
+
+    if not title:
+        return
+
     loop = asyncio.get_running_loop()
+
+    # Hủy tham chiếu tác vụ cũ để tránh giữ task không cần thiết.
+    old_task = related_tasks.get(gid)
+
+    if old_task is not None and not old_task.done():
+        return
+
     related_tasks[gid] = loop.run_in_executor(
-        EXECUTOR, find_related,
-        data.get("yt_id"), data.get("title"), set(recent_ids[gid]),
+        EXECUTOR,
+        find_related,
+        data.get("yt_id"),
+        title,
+        set(recent_ids[gid]),
     )
 
 
 async def get_related_async(gid: int):
-    """Lấy bài gợi ý đã tìm sẵn; chưa có thì tìm ngay (không chặn event loop)."""
+    """
+    Lấy bài đã tìm trước; nếu chưa có thì tìm ngay
+    mà không chặn Discord event loop.
+    """
     task = related_tasks.pop(gid, None)
+
     if task is not None:
         try:
             result = await task
-            # Bài tìm sẵn có thể đã trùng bài vừa phát sau đó
+
+            # Kiểm tra lại để tránh phát trùng bài.
             if result and result["id"] not in recent_ids[gid]:
                 return result
-        except Exception:
-            pass
-    seed = now_data.get(gid) or {}
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        EXECUTOR, find_related,
-        seed.get("yt_id"), seed.get("title"), set(recent_ids[gid]),
-    )
 
+        except Exception as exc:
+            print("Lỗi lấy bài gợi ý đã tìm trước:", exc)
+
+    seed = now_data.get(gid) or {}
+    title = seed.get("title")
+
+    if not title:
+        return None
+
+    loop = asyncio.get_running_loop()
+
+    return await loop.run_in_executor(
+        EXECUTOR,
+        find_related,
+        seed.get("yt_id"),
+        title,
+        set(recent_ids[gid]),
+    )
 
 # ==================== PHÁT NHẠC & TUA ====================
 
