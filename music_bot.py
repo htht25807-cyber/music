@@ -65,7 +65,10 @@ AUTO_MAX_SECONDS = 20 * 60
 RESOLVED_CACHE_TTL_SECONDS = 45 * 60  # URL stream có hạn sử dụng, không giữ cache quá lâu
 RESOLVED_CACHE_MAX_ITEMS = 250
 
-# Tự xóa tin nhắn của bot đã cũ trong kênh được dùng lệnh (mặc định 30 phút).
+# Tự xóa tin nhắn xác nhận đã thêm bài vào hàng đợi sau vài giây.
+QUEUE_NOTICE_TTL_SECONDS = 8
+
+# Tự xóa tin nhắn khác của bot đã cũ trong kênh được dùng lệnh (mặc định 30 phút).
 BOT_MESSAGE_TTL_SECONDS = 30 * 60
 MESSAGE_CLEANUP_INTERVAL_SECONDS = 5 * 60
 
@@ -99,6 +102,19 @@ related_tasks = {}                             # (guild_id, seed_key) -> tác v�
 
 # Dữ liệu riêng cho từng người dùng
 favorites = defaultdict(list)                # user_id -> [{"title": ..., "url": ...}]
+
+
+async def delete_message_after_delay(message, delay: int = QUEUE_NOTICE_TTL_SECONDS):
+    """Tự xóa tin nhắn xác nhận đã thêm bài, tránh làm rối kênh chat."""
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass  # Tin nhắn đã bị xóa trước đó.
+    except discord.Forbidden:
+        print("Bot không có quyền xóa tin nhắn xác nhận trong kênh này.")
+    except discord.HTTPException as exc:
+        print(f"Không xóa được tin nhắn xác nhận: {exc}")
 
 
 # ==================== SEARCH MUSIC ====================
@@ -924,9 +940,12 @@ async def play(inter: discord.Interaction, query: str):
         queues[inter.guild.id].extend(items)
         if queues[inter.guild.id]:
             schedule_resolution(queues[inter.guild.id][0])
-        await inter.followup.send(
-            f"➕ Đã thêm **{len(items)} bài** vào hàng đợi."
+        notice = await inter.followup.send(
+            f"➕ Đã thêm **{len(items)} bài** vào hàng đợi.",
+            wait=True,
         )
+        # Xóa riêng dòng xác nhận sau 8 giây; không đụng đến menu đang phát.
+        asyncio.create_task(delete_message_after_delay(notice))
 
         if not vc.is_playing() and not vc.is_paused():
             await play_next(inter.guild, inter.channel)
