@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import shutil
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -30,36 +31,21 @@ except Exception:
     sp = None
 
 YDL_OPTS = {
-    "format": "bestaudio[acodec=opus]/bestaudio/best",
+    "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "socket_timeout": 10,
-    "retries": 2,
-    "cachedir": "/tmp/yt-dlp-cache",
-    "check_formats": False,
-
-    "extractor_args": {
-        "youtube": {
-            "skip": ["dash", "hls", "translated_subs"]
-        },
-        "youtubetab": {
-            "skip": ["authcheck"]
-        }
-    },
 }
 
 FFMPEG_OPTS = {
     "before_options": (
-        "-nostdin "
         "-reconnect 1 "
         "-reconnect_streamed 1 "
-        "-reconnect_delay_max 5 "
-        "-analyzeduration 0 "
-        "-probesize 32768"
+        "-reconnect_delay_max 5"
     ),
     "options": "-vn",
 }
+
 # Cookies YouTube (không bắt buộc): trên Render thêm Secret File tên cookies.txt
 COOKIES_SRC = os.environ.get("YT_COOKIES_FILE", "/etc/secrets/cookies.txt")
 COOKIE_OPTS = {}
@@ -73,10 +59,26 @@ if os.path.exists(COOKIES_SRC):
         print("Không nạp được cookies YouTube:", exc)
 else:
     print("Chưa có cookies YouTube (YouTube có thể chặn IP của server).")
-YDL_OPTS.update(COOKIE_OPTS)
+
+# Tùy chọn chung cho mọi lần gọi yt-dlp: mạng treo thì báo lỗi sớm thay vì chờ mãi
+COMMON_OPTS = {**COOKIE_OPTS, "socket_timeout": 15}
+YDL_OPTS.update(COMMON_OPTS)
+
+# Tùy chọn tăng tốc (mặc định tắt): chọn client YouTube cho yt-dlp, ví dụ YT_PLAYER_CLIENT=visionos
+_player_client = os.environ.get("YT_PLAYER_CLIENT", "").strip()
+if _player_client:
+    YDL_OPTS["extractor_args"] = {
+        "youtube": {"player_client": [c.strip() for c in _player_client.split(",") if c.strip()]}
+    }
+    print(f"yt-dlp dùng player_client: {_player_client}")
 
 # Bài tự động phát tiếp sẽ bỏ qua video dài hơn mức này (livestream, mix hàng giờ...)
 AUTO_MAX_SECONDS = 20 * 60
+
+# Tải trước bài kế tiếp để chuyển bài/skip gần như tức thì
+TRACK_CACHE_TTL = 3600       # Link stream giữ lại 1 giờ (link YouTube thường sống vài giờ)
+EXTRACT_TIMEOUT = 60         # Quá 60 giây chưa lấy được link thì báo lỗi, không chờ mãi
+PREFETCH_DELAY = 5           # Chờ 5 giây sau khi bài bắt đầu phát rồi mới tải trước bài sau
 
 # Tự dọn tin nhắn cũ của bot trong các kênh đã dùng lệnh
 CLEANUP_INTERVAL = 300       # Quét mỗi 5 phút
@@ -85,14 +87,6 @@ CLEANUP_IDLE_LIMIT = 3600    # Kênh 1 giờ không có lệnh thì dọn lần 
 
 # Lấy tên bài YouTube nhanh (không cần yt-dlp) để hiện hàng đợi
 OEMBED_URL = "https://www.youtube.com/oembed"
-
-# Pool luồng riêng + cache kết quả tìm kiếm (link stream YouTube sống ~6 giờ)
-EXECUTOR = ThreadPoolExecutor(max_workers=4)
-CACHE_TTL = 4 * 3600
-_cache = {}                  # query -> (hết hạn, data)
-_inflight = {}               # query -> Future (gộp các yêu cầu trùng nhau)
-related_tasks = {}           # guild_id -> Future tìm sẵn bài gợi ý
-_http_session = None         # aiohttp session dùng chung (oEmbed)
 
 # Dữ liệu riêng cho từng server
 queues = defaultdict(list)                  # Hàng đợi phát lần lượt
@@ -110,6 +104,11 @@ titles = {}                                  # query/link -> tên bài (để hi
 stopping = set()                             # Server đang chạy /stop (chặn tự phát bài mới)
 auto_paused = set()                          # Server đang tạm dừng vì kênh thoại trống (tự tiếp tục khi có người về)
 waiting_for_listener = set()                 # Hết bài lúc kênh trống: chờ có người vào lại mới phát tiếp
+track_cache = {}                             # query -> (thời điểm, dữ liệu phát) đã lấy xong
+inflight = {}                                # query -> lượt tải đang chạy (để không tải trùng)
+planned = {}                                 # Bài kế tiếp (tự chọn) đã chuẩn bị sẵn cho mỗi server
+prefetch_tasks = {}                          # Tác vụ tải trước đang chạy của mỗi server
+_bg_tasks = set()                            # Giữ tham chiếu các tác vụ nền
 play_gen = defaultdict(int)                  # Đánh số mỗi lần phát; callback của lần phát cũ (bị tua/thay) sẽ bị bỏ qua
 cleanup_channels = {}                        # channel_id -> [kênh, lần cuối có người dùng lệnh]
 
@@ -120,351 +119,252 @@ favorites = defaultdict(list)                # user_id -> [{"title": ..., "url":
 # ==================== SEARCH MUSIC ====================
 
 def extract(query: str) -> dict:
-    """Lấy URL stream và tên bài hát bằng yt-dlp (đồng bộ, chạy trong luồng riêng)."""
+    """Lấy URL stream và tên bài hát bằng yt-dlp."""
     if query.startswith("http"):
         candidates = [query]
     else:
         candidates = [f"ytsearch1:{query}", f"scsearch1:{query}"]
 
     last_err = None
-    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:  # Tạo 1 lần cho cả vòng lặp
-        for candidate in candidates:
-            try:
+    for candidate in candidates:
+        try:
+            with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
                 info = ydl.extract_info(candidate, download=False)
 
-                if not info:
+            if not info:
+                continue
+
+            if "entries" in info:
+                entries = info.get("entries") or []
+                if not entries:
                     continue
+                info = entries[0]
 
-                if "entries" in info:
-                    entries = info.get("entries") or []
-                    if not entries:
-                        continue
-                    info = entries[0]
-
-                if info and info.get("url"):
-                    return {
-                        "url": info["url"],
-                        "title": info.get("title", query),
-                        "page": info.get("webpage_url")
-                        or (candidate if candidate.startswith("http") else None),
-                        "yt_id": info.get("id")
-                        if info.get("extractor_key") == "Youtube" else None,
-                        "duration": info.get("duration"),
-                        "uploader": info.get("uploader") or info.get("channel"),
-                        "thumbnail": info.get("thumbnail"),
-                        "chapters": info.get("chapters"),
-                    }
-            except Exception as exc:
-                last_err = exc
+            if info and info.get("url"):
+                return {
+                    "url": info["url"],
+                    "title": info.get("title", query),
+                    "page": info.get("webpage_url")
+                    or (candidate if candidate.startswith("http") else None),
+                    "yt_id": info.get("id")
+                    if info.get("extractor_key") == "Youtube" else None,
+                    "duration": info.get("duration"),
+                    "uploader": info.get("uploader") or info.get("channel"),
+                    "thumbnail": info.get("thumbnail"),
+                    "chapters": info.get("chapters"),
+                }
+        except Exception as exc:
+            last_err = exc
 
     if last_err:
         raise last_err
     raise RuntimeError("Không tìm thấy bài hát.")
 
 
-async def extract_async(query: str) -> dict:
-    """Không chặn event loop, có cache, gộp các yêu cầu trùng nhau."""
-    key = query.strip().lower()
-    hit = _cache.get(key)
-    if hit and hit[0] > time.time():
-        return dict(hit[1])
-
-    if key in _inflight:
-        return dict(await asyncio.shield(_inflight[key]))
-
-    loop = asyncio.get_running_loop()
-    fut = loop.run_in_executor(EXECUTOR, extract, query)
-    _inflight[key] = fut
-    try:
-        data = await fut
-    finally:
-        _inflight.pop(key, None)
-
-    _cache[key] = (time.time() + CACHE_TTL, data)
-    if len(_cache) > 300:  # Giữ RAM nhỏ trên Render
-        for k in sorted(_cache, key=lambda k: _cache[k][0])[:100]:
-            _cache.pop(k, None)
-    return dict(data)
-
-
-def prefetch_next(gid: int):
-    """Tìm sẵn bài kế tiếp trong hàng đợi để chuyển bài gần như tức thì."""
-    q = queues[gid]
-    if q and isinstance(q[0], str):
-        asyncio.ensure_future(_safe_prefetch(q[0]))
-
-
-async def _safe_prefetch(query: str):
-    try:
-        await extract_async(query)
-    except Exception:
-        pass
-
-
 # ==================== SPOTIFY ====================
 
-def _spotify_fallback_queries(link: str) -> list[str]:
-    """
-    Fallback khi Spotify Web API trả 403:
-    thử lấy metadata bằng yt-dlp; nếu là một track, dùng Spotify oEmbed
-    để lấy tên hiển thị rồi chuyển sang tìm trên YouTube.
-    """
-    # Một số phiên bản yt-dlp có thể đọc được metadata Spotify mà không cần
-    # dùng credential Spotify do người dùng cấu hình.
-    try:
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": True,
-            "skip_download": True,
-            "socket_timeout": 8,
-            "retries": 1,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(link, download=False)
+def spotify_to_queries(link: str) -> list[str]:
+    if sp is None:
+        raise RuntimeError("Chưa cấu hình SPOTIFY_ID và SPOTIFY_SECRET.")
 
-        if info:
-            entries = info.get("entries")
-            if entries is not None:
-                found = []
-                for entry in entries:
-                    if not entry:
-                        continue
-                    title = entry.get("title")
-                    artist = entry.get("artist") or entry.get("uploader")
-                    if title:
-                        found.append(f"{artist} - {title}" if artist else title)
-                if found:
-                    return found
-            title = info.get("title")
-            artist = info.get("artist") or info.get("uploader")
-            if title:
-                return [f"{artist} - {title}" if artist else title]
-    except Exception as exc:
-        print("Spotify fallback qua yt-dlp không thành công:", exc)
-
-    # Spotify oEmbed thường cung cấp tiêu đề cho track/album/playlist.
-    # Nó không đảm bảo trả về toàn bộ tracklist của album/playlist.
     if "/track/" in link:
-        try:
-            import json
-            from urllib.parse import urlencode
-            from urllib.request import Request, urlopen
+        track = sp.track(link)
+        return [f"{track['artists'][0]['name']} - {track['name']}"]
 
-            endpoint = "https://open.spotify.com/oembed?" + urlencode({"url": link})
-            req = Request(endpoint, headers={"User-Agent": "Mozilla/5.0"})
-            with urlopen(req, timeout=8) as response:
-                payload = json.loads(response.read().decode("utf-8", "replace"))
-            title = (payload.get("title") or "").strip()
-            if title:
-                # Tiêu đề oEmbed có thể chỉ là tên bài; YouTube Search sẽ xử lý phần còn lại.
-                return [title]
-        except Exception as exc:
-            print("Spotify oEmbed fallback không thành công:", exc)
+    if "/album/" in link:
+        items = sp.album_tracks(link, limit=50)["items"]
+        return [
+            f"{item['artists'][0]['name']} - {item['name']}"
+            for item in items if item.get("artists")
+        ]
+
+    if "/playlist/" in link:
+        result = []
+        results = sp.playlist_items(link, limit=100)
+        for item in results.get("items", []):
+            track = item.get("track")
+            if track and track.get("artists"):
+                result.append(
+                    f"{track['artists'][0]['name']} - {track['name']}"
+                )
+        return result
 
     raise RuntimeError(
-        "Spotify đang từ chối truy cập danh sách bài qua API (HTTP 403). "
-        "Đã thử phương án dự phòng nhưng không lấy được tracklist. "
-        "Với bài đơn, thử gửi lại link; với album/playlist, hãy dùng link YouTube "
-        "hoặc thử sau khi Spotify khôi phục quyền truy cập."
+        "Link Spotify không được hỗ trợ. Dùng link track, album hoặc playlist."
     )
-
-
-def spotify_to_queries(link: str) -> list[str]:
-    """Đổi link Spotify thành truy vấn tìm nhạc; có fallback khi API trả 403."""
-    if sp is None:
-        return _spotify_fallback_queries(link)
-
-    try:
-        if "/track/" in link:
-            track = sp.track(link)
-            artists = track.get("artists") or []
-            if track.get("name"):
-                artist = artists[0].get("name") if artists else None
-                return [f"{artist} - {track['name']}" if artist else track["name"]]
-
-        elif "/album/" in link:
-            result = []
-            page = sp.album_tracks(link, limit=50)
-            while page:
-                for item in page.get("items", []):
-                    artists = item.get("artists") or []
-                    if item.get("name"):
-                        artist = artists[0].get("name") if artists else None
-                        result.append(f"{artist} - {item['name']}" if artist else item["name"])
-                if not page.get("next"):
-                    break
-                page = sp.next(page)
-            if result:
-                return result
-
-        elif "/playlist/" in link:
-            result = []
-            page = sp.playlist_items(link, limit=100)
-            while page:
-                for item in page.get("items", []):
-                    track = item.get("track")
-                    if not track or not track.get("name"):
-                        continue
-                    artists = track.get("artists") or []
-                    artist = artists[0].get("name") if artists else None
-                    result.append(f"{artist} - {track['name']}" if artist else track["name"])
-                if not page.get("next"):
-                    break
-                page = sp.next(page)
-            if result:
-                return result
-
-        else:
-            raise RuntimeError(
-                "Link Spotify không được hỗ trợ. Dùng link track, album hoặc playlist."
-            )
-
-        # API trả kết quả rỗng thì thử fallback thay vì làm hỏng lệnh /play.
-        return _spotify_fallback_queries(link)
-
-    except Exception as exc:
-        print(f"Spotify Web API lỗi ({type(exc).__name__}): {exc}")
-        return _spotify_fallback_queries(link)
 
 
 # ==================== AUTO NEXT (BÀI GỢI Ý) ====================
 
 def find_related(video_id, title, played: set):
-    """Lấy bài tự phát tiếp theo theo hướng gần với YouTube Autoplay.
+    """Tìm bài gợi ý giống YouTube autoplay.
 
-    Ưu tiên danh sách YouTube Mix/Up next (RD + video hiện tại), sau đó
-    mới fallback sang tìm kiếm theo tên bài nếu Mix bị YouTube chặn.
+    Ưu tiên YouTube Mix của bài vừa phát; nếu không có thì tìm theo tên bài.
+    Bỏ qua bài đã phát (played) và video quá dài (livestream, mix hàng giờ).
     """
-    if not video_id and not (title and title.strip()):
-        return None
-
     opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
         "playlistend": 25,
-        "socket_timeout": 10,
-        "retries": 1,
-        "cachedir": "/tmp/yt-dlp-cache",
-        "extractor_args": {
-            "youtubetab": {"skip": ["authcheck"]},
-        },
-        **COOKIE_OPTS,
+        **COMMON_OPTS,
     }
-
     sources = []
     if video_id:
-        # RD playlist là YouTube Mix/Autoplay dựa trên video đang phát.
         sources.append(
             f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
         )
-    if title and title.strip():
-        # Dự phòng nếu YouTube không cho lấy Mix.
-        sources.append(f"ytsearch10:{title.strip()}")
+    if title:
+        sources.append(f"ytsearch10:{title}")
 
-    excluded_ids = set(played or set())
-    if video_id:
-        excluded_ids.add(video_id)
-
-    for source in sources:
+    for index, src in enumerate(sources):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(source, download=False)
+                info = ydl.extract_info(src, download=False)
         except Exception as exc:
-            print(f"Không lấy được gợi ý từ {source[:90]!r}: {exc}")
+            print("Không tìm được bài gợi ý:", exc)
             continue
 
-        entries = [entry for entry in (info or {}).get("entries") or [] if entry]
-        if source.startswith("ytsearch"):
-            # Kết quả đầu thường chính là bài hiện tại hoặc bản gần giống.
+        entries = [e for e in (info or {}).get("entries") or [] if e]
+        # Kết quả tìm theo tên: bỏ kết quả đầu vì thường là chính bài vừa phát
+        if src.startswith("ytsearch"):
             entries = entries[1:]
 
         for entry in entries:
             vid = entry.get("id")
-            if not vid or vid in excluded_ids:
+            if not vid or vid in played:
                 continue
-
-            if entry.get("is_live") or entry.get("live_status") in ("is_live", "is_upcoming"):
-                continue
-
             duration = entry.get("duration")
-            if duration is not None and duration > AUTO_MAX_SECONDS:
+            if duration and duration > AUTO_MAX_SECONDS:
                 continue
+            return {"id": vid, "url": f"https://www.youtube.com/watch?v={vid}"}
 
-            return {
-                "id": vid,
-                "url": f"https://www.youtube.com/watch?v={vid}",
-            }
-
-    print(f"Không tìm được bài tự phát tiếp theo cho: {title!r}")
     return None
 
 
-def prefetch_related(gid: int):
-    """
-    Tìm trước bài liên quan trong lúc bài hiện tại đang phát.
-    Chỉ tìm khi hàng đợi và danh sách nhạc đều trống.
-    """
-    if not autoplay[gid] or queues[gid] or music_lists[gid]:
-        return
+# ==================== TẢI TRƯỚC & CACHE ====================
 
-    data = now_data.get(gid) or {}
-    title = data.get("title")
-
-    if not title:
-        return
-
-    loop = asyncio.get_running_loop()
-
-    # Hủy tham chiếu tác vụ cũ để tránh giữ task không cần thiết.
-    old_task = related_tasks.get(gid)
-
-    if old_task is not None and not old_task.done():
-        return
-
-    related_tasks[gid] = loop.run_in_executor(
-        EXECUTOR,
-        find_related,
-        data.get("yt_id"),
-        title,
-        set(recent_ids[gid]),
-    )
+def _lower_priority():
+    """Chạy ở luồng tải trước: hạ độ ưu tiên để không làm giật nhạc đang phát."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)
+    except Exception:
+        pass
 
 
-async def get_related_async(gid: int):
-    """
-    Lấy bài đã tìm trước; nếu chưa có thì tìm ngay
-    mà không chặn Discord event loop.
-    """
-    task = related_tasks.pop(gid, None)
+PREFETCH_POOL = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="prefetch", initializer=_lower_priority
+)
 
-    if task is not None:
+
+def timed_extract(query: str) -> dict:
+    t0 = time.time()
+    try:
+        return extract(query)
+    finally:
+        print(f"⏱ Lấy link {query[:50]!r} mất {time.time() - t0:.1f}s")
+
+
+async def get_track(query: str, background: bool = False) -> dict:
+    """Lấy thông tin phát của bài: dùng cache nếu có, không tải trùng khi đang có lượt tải cùng bài."""
+    hit = track_cache.get(query)
+    if hit and time.time() - hit[0] < TRACK_CACHE_TTL:
+        return hit[1]
+
+    fut = inflight.get(query)
+    if fut is None:
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(
+            PREFETCH_POOL if background else None, timed_extract, query
+        )
+        inflight[query] = fut
+
+        def done(f):
+            inflight.pop(query, None)
+            if f.cancelled():
+                return
+            if f.exception() is None:
+                track_cache[query] = (time.time(), f.result())
+                if len(track_cache) > 300:  # Dọn bớt bài đã hết hạn
+                    now = time.time()
+                    for key in [k for k, (t, _) in track_cache.items() if now - t > TRACK_CACHE_TTL]:
+                        track_cache.pop(key, None)
+
+        fut.add_done_callback(done)
+
+    return await asyncio.shield(fut)
+
+
+def warm_track(query: str, background: bool = False):
+    """Bắt đầu lấy link ngay (chạy nền), lỗi thì bỏ qua; lúc phát thật sẽ lấy kết quả từ cache."""
+    async def run():
         try:
-            result = await task
+            await get_track(query, background=background)
+        except Exception:
+            pass
 
-            # Kiểm tra lại để tránh phát trùng bài.
-            if result and result["id"] not in recent_ids[gid]:
-                return result
+    task = asyncio.create_task(run())
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
-        except Exception as exc:
-            print("Lỗi lấy bài gợi ý đã tìm trước:", exc)
 
-    seed = now_data.get(gid) or {}
-    title = seed.get("title")
+def warm_up_ytdlp():
+    """Nạp sẵn bộ trích xuất YouTube để lệnh đầu tiên không phải chờ nạp."""
+    t0 = time.time()
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, **COMMON_OPTS}) as ydl:
+            ydl.get_info_extractor("Youtube")
+        print(f"⏱ Nạp sẵn yt-dlp mất {time.time() - t0:.1f}s")
+    except Exception as exc:
+        print("Không nạp sẵn được yt-dlp:", exc)
 
-    if not title:
-        return None
 
-    loop = asyncio.get_running_loop()
+def pick_from_list(gid: int) -> str:
+    """Chọn ngẫu nhiên một bài từ danh sách nhạc, tránh trùng bài đang phát."""
+    choices = list(music_lists[gid])
+    previous = current_song.get(gid)
+    if len(choices) > 1 and previous in choices:
+        choices.remove(previous)
+    return random.choice(choices)
 
-    return await loop.run_in_executor(
-        EXECUTOR,
-        find_related,
-        seed.get("yt_id"),
-        title,
-        set(recent_ids[gid]),
-    )
+
+async def prefetch_next(guild: discord.Guild):
+    """Chuẩn bị sẵn bài kế tiếp lúc bài hiện tại đang phát, để hết bài hoặc skip là phát ngay."""
+    gid = guild.id
+    await asyncio.sleep(PREFETCH_DELAY)  # Để bài hiện tại bắt đầu phát êm đã
+    vc = guild.voice_client
+    if gid in stopping or not vc or not vc.is_connected():
+        return
+
+    try:
+        q = queues[gid]
+        if q:
+            target = q[0]
+        elif autoplay[gid] and music_lists[gid]:
+            target = pick_from_list(gid)
+            planned[gid] = {"query": target, "auto_id": None}
+        elif autoplay[gid]:
+            if listener_count(vc.channel) == 0:
+                return
+            seed = now_data.get(gid) or {}
+            loop = asyncio.get_running_loop()
+            found = await loop.run_in_executor(
+                PREFETCH_POOL, find_related,
+                seed.get("yt_id"), seed.get("title"), set(recent_ids[gid]),
+            )
+            if not found:
+                return
+            target = found["url"]
+            planned[gid] = {"query": target, "auto_id": found["id"]}
+        else:
+            return
+
+        await get_track(target, background=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print("Không tải trước được bài kế tiếp:", exc)
+
 
 # ==================== PHÁT NHẠC & TUA ====================
 
@@ -483,11 +383,14 @@ class TrackedSource(discord.PCMVolumeTransformer):
         super().__init__(original, volume=volume)
         self.start_at = start_at
         self.frames = 0
+        self.created = time.time()
 
     def read(self):
         data = super().read()
         if data:
             self.frames += 1
+            if self.frames == 1:
+                print(f"⏱ ffmpeg mở luồng, có âm thanh sau {time.time() - self.created:.1f}s")
         return data
 
     @property
@@ -517,14 +420,6 @@ def start_playback(guild: discord.Guild, channel, data: dict, start_at: float = 
     )
     source = TrackedSource(audio, volume=volumes[gid], start_at=start_at)
     vc.play(source, after=after)
-
-    # Tìm sẵn bài kế tiếp (không làm lại mỗi lần tua)
-    if start_at == 0:
-        try:
-            prefetch_next(gid)
-            prefetch_related(gid)
-        except Exception as exc:
-            print("Lỗi prefetch:", exc)
 
 
 def seek_to(guild: discord.Guild, seconds: float) -> bool:
@@ -805,21 +700,22 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
 
     q = queues[gid]
     auto_id = None  # id video nếu bài này do bot tự chọn
+    plan = planned.pop(gid, None)  # Bài kế tiếp đã chuẩn bị sẵn lúc bài trước bắt đầu phát
 
     if q:
         query = q.pop(0)
+    elif autoplay[gid] and plan:
+        query, auto_id = plan["query"], plan["auto_id"]
     elif autoplay[gid] and music_lists[gid]:
-        choices = list(music_lists[gid])
-        previous = current_song.get(gid)
-
-        # Tránh phát trùng bài hiện tại nếu danh sách có nhiều lựa chọn
-        if len(choices) > 1 and previous in choices:
-            choices.remove(previous)
-
-        query = random.choice(choices)
+        query = pick_from_list(gid)
     elif autoplay[gid]:
         # Hết hàng đợi và không có danh sách nhạc: tự mở bài liên quan như YouTube
-        found = await get_related_async(gid)
+        seed = now_data.get(gid) or {}
+        loop = asyncio.get_running_loop()
+        found = await loop.run_in_executor(
+            None, find_related,
+            seed.get("yt_id"), seed.get("title"), set(recent_ids[gid]),
+        )
         if not found:
             return
         query, auto_id = found["url"], found["id"]
@@ -827,15 +723,17 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
         return
 
     try:
-        data = await extract_async(query)
+        data = await asyncio.wait_for(get_track(query), EXTRACT_TIMEOUT)
     except Exception as exc:
         if auto_id:
             recent_ids[gid].append(auto_id)  # Không chọn lại bài lỗi này
             if retries < 2:
                 return await play_next(guild, channel, retries + 1)
-        print(f"Lỗi lấy bài {query[:80]!r}: {exc}")
+        print(f"Lỗi lấy bài {query[:80]!r}: {str(exc) or type(exc).__name__}")
         reason = str(exc)
-        if "Sign in to confirm" in reason or "cookies" in reason.lower():
+        if isinstance(exc, asyncio.TimeoutError):
+            reason = "Lấy link quá lâu (YouTube hoặc server phản hồi chậm), hãy thử lại."
+        elif "Sign in to confirm" in reason or "cookies" in reason.lower():
             reason = (
                 "YouTube đang chặn IP của server và đòi đăng nhập. "
                 "Cần thêm cookies cho bot (Secret File cookies.txt trên Render)."
@@ -874,6 +772,12 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
     except Exception as exc:
         print("Không thể phát:", exc)
         return await play_next(guild, channel)
+
+    # Tải trước bài kế tiếp trong lúc bài này đang phát
+    old = prefetch_tasks.get(gid)
+    if old and not old.done():
+        old.cancel()
+    prefetch_tasks[gid] = asyncio.create_task(prefetch_next(guild))
 
     try:
         embed = build_now_playing_embed(data, gid, auto=bool(auto_id))
@@ -927,19 +831,15 @@ async def cleanup_loop():
 
 class MusicBot(discord.Client):
     def __init__(self):
-        super().__init__(
-            intents=discord.Intents.default(),
-            chunk_guilds_at_startup=False,
-        )
+        super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
         self._cleanup_task = None
 
     async def setup_hook(self):
-        # Đặt biến môi trường SYNC=0 để bỏ qua sync lệnh khi khởi động (khởi động nhanh hơn)
-        if os.environ.get("SYNC", "1") != "0":
-            await self.tree.sync()
+        await self.tree.sync()
         if self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(cleanup_loop())
+        asyncio.get_running_loop().run_in_executor(None, warm_up_ytdlp)
 
     async def on_interaction(self, inter: discord.Interaction):
         # Ghi nhớ kênh đã dùng lệnh để tự dọn tin nhắn cũ của bot ở đó
@@ -985,7 +885,13 @@ async def play(inter: discord.Interaction, query: str):
         )
 
     await inter.response.defer()
+    if "open.spotify.com" not in query:
+        # Bắt đầu lấy link ngay, song song với việc vào kênh thoại.
+        # Đang phát bài khác thì chạy nền với độ ưu tiên thấp để không làm giật nhạc.
+        current = inter.guild.voice_client
+        warm_track(query, background=bool(current and (current.is_playing() or current.is_paused())))
     try:
+        t0 = time.time()
         vc = inter.guild.voice_client
         if vc is None:
             vc = await inter.user.voice.channel.connect()
@@ -993,12 +899,14 @@ async def play(inter: discord.Interaction, query: str):
             vc = await inter.user.voice.channel.connect()
         elif vc.channel != inter.user.voice.channel:
             await vc.move_to(inter.user.voice.channel)
+        if time.time() - t0 > 0.3:
+            print(f"⏱ Vào kênh thoại mất {time.time() - t0:.1f}s")
 
         play_channels[inter.guild.id] = inter.channel
 
         if "open.spotify.com" in query:
             loop = asyncio.get_running_loop()
-            items = await loop.run_in_executor(EXECUTOR, spotify_to_queries, query)
+            items = await loop.run_in_executor(None, spotify_to_queries, query)
         else:
             items = [query]
 
@@ -1109,10 +1017,9 @@ async def resolve_titles(items: list) -> list:
                 pass
         return item  # Link khác hoặc không lấy được tên: hiện nguyên văn
 
-    global _http_session
-    if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4))
-    return list(await asyncio.gather(*(one(_http_session, i) for i in items)))
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        return list(await asyncio.gather(*(one(session, i) for i in items)))
 
 
 async def perform_skip(guild: discord.Guild, channel, index: int):
@@ -1496,6 +1403,10 @@ async def stop(inter: discord.Interaction):
 
     current_song.pop(gid, None)
     now_data.pop(gid, None)
+    planned.pop(gid, None)
+    task = prefetch_tasks.pop(gid, None)
+    if task and not task.done():
+        task.cancel()
     auto_paused.discard(gid)
     waiting_for_listener.discard(gid)
     await clear_menu(gid)
@@ -1504,7 +1415,7 @@ async def stop(inter: discord.Interaction):
 
 def search_youtube(query: str, limit: int = 10) -> list[dict]:
     """Tìm trên YouTube, chỉ lấy thông tin cơ bản (nhanh, không tải gì)."""
-    opts = {"quiet": True, "no_warnings": True, "extract_flat": True, **COOKIE_OPTS}
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": True, **COMMON_OPTS}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
 
@@ -1553,6 +1464,11 @@ class SearchSelect(discord.ui.Select):
             )
 
         await inter.response.defer()
+        current = inter.guild.voice_client
+        warm_track(
+            chosen["url"],
+            background=bool(current and (current.is_playing() or current.is_paused())),
+        )
         try:
             vc = inter.guild.voice_client
             if vc is None or not vc.is_connected():
@@ -1607,10 +1523,16 @@ async def search(inter: discord.Interaction, query: str):
 
     await inter.response.defer()
     loop = asyncio.get_running_loop()
+    t0 = time.time()
     try:
-        results = await loop.run_in_executor(None, search_youtube, query)
+        results = await asyncio.wait_for(
+            loop.run_in_executor(None, search_youtube, query), 25
+        )
+    except asyncio.TimeoutError:
+        return await inter.followup.send("❌ YouTube phản hồi quá chậm, hãy thử lại.")
     except Exception as exc:
         return await inter.followup.send(f"❌ Không tìm được: {str(exc)[:200]}")
+    print(f"⏱ Tìm {query[:40]!r} mất {time.time() - t0:.1f}s")
 
     if not results:
         return await inter.followup.send("❌ Không có kết quả nào.")
